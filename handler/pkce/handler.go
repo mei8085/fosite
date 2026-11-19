@@ -15,6 +15,7 @@ import (
 
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/handler/oauth2"
+	"github.com/ory/fosite/storage"
 )
 
 var _ fosite.TokenEndpointHandler = (*Handler)(nil)
@@ -136,7 +137,13 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 
 	nv := len(verifier)
 
-	if errors.Is(err, fosite.ErrNotFound) {
+	if errors.Is(err, ErrPKCERequestSessionConsumed) || errors.Is(err, storage.ErrInvalidatedPKCERequest) {
+		// The session was retained by the storage in a consumed state. Reject the
+		// replay with the same stable result regardless of the verifier sent.
+		return errorsx.WithStack(fosite.ErrInvalidGrant.
+			WithHint("The PKCE request session has already been used.").
+			WithWrap(err).WithDebug(err.Error()))
+	} else if errors.Is(err, fosite.ErrNotFound) {
 		if nv == 0 {
 			return c.validateNoPKCE(ctx, request.GetClient())
 		}
@@ -146,8 +153,13 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
 
-	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
-		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
+	// A session that has already been consumed must not be made usable again.
+	// Keeping the consumed state around (rather than hard-deleting it ahead of
+	// validation) is what makes replays and retries after a failed verification
+	// return a stable, denial result instead of a confusing "not found" error or,
+	// when PKCE is not enforced, an accidental successful downgrade.
+	if err := validatePKCERequestNotConsumed(pkceRequest); err != nil {
+		return err
 	}
 
 	challenge := pkceRequest.GetRequestForm().Get("code_challenge")
@@ -161,6 +173,15 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 
 	if !c.Config.GetEnforcePKCE(ctx) && nc == 0 && nv == 0 {
 		return nil
+	}
+
+	// The PKCE session is bound to the client that initiated the authorization
+	// request. A different client attempting the exchange must never be able to
+	// validate against (and consume) another client's challenge.
+	requestClient := request.GetClient()
+	if client == nil || requestClient == nil || client.GetID() != requestClient.GetID() {
+		return errorsx.WithStack(fosite.ErrInvalidGrant.
+			WithHint("The OAuth 2.0 Client ID from this request does not match the one from the authorize request."))
 	}
 
 	// NOTE: The code verifier SHOULD have enough entropy to make it
@@ -224,6 +245,24 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 			return errorsx.WithStack(fosite.ErrInvalidGrant.
 				WithHint("The PKCE code challenge did not match the code verifier."))
 		}
+	}
+
+	// The verifier has been validated successfully. Only now may the stored PKCE
+	// session be consumed. Deleting it before this point would destroy the
+	// challenge on a failed verification, which would let retries (and concurrent
+	// exchanges) take a different, potentially weaker code path. The authorization
+	// code itself is atomically invalidated later by the authorize code grant
+	// handler, so a failure here leaves every retry with identical state and an
+	// identical invalid_grant result.
+	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
+		if errors.Is(err, storage.ErrInvalidatedPKCERequest) || errors.Is(err, ErrPKCERequestSessionConsumed) {
+			// A concurrent exchange consumed the session first. The loser of the
+			// race gets the same stable result as any other replay.
+			return errorsx.WithStack(fosite.ErrInvalidGrant.
+				WithHint("The PKCE request session has already been used.").
+				WithWrap(err).WithDebug(err.Error()))
+		}
+		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
 
 	return nil

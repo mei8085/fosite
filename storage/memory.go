@@ -107,6 +107,36 @@ type StoreRefreshToken struct {
 	fosite.Requester
 }
 
+// ErrInvalidatedPKCERequest indicates that a PKCE session has already been
+// consumed by a successful token exchange. The original requester is returned
+// alongside the error, mirroring the contract of ErrInvalidatedAuthorizeCode.
+var ErrInvalidatedPKCERequest = errors.New("PKCE request session has been invalidated")
+
+// consumedPKCERequester marks a PKCE requester as consumed. It keeps the
+// original requester embedded so the stored session stays fully hydrated while
+// the active flag can be observed independently.
+type consumedPKCERequester struct {
+	fosite.Requester
+}
+
+func markPKCERequestConsumed(req fosite.Requester) fosite.Requester {
+	if req == nil {
+		return nil
+	}
+	if _, ok := req.(consumedPKCERequester); ok {
+		return req
+	}
+	return consumedPKCERequester{Requester: req}
+}
+
+func isPKCERequestConsumed(req fosite.Requester) bool {
+	if req == nil {
+		return false
+	}
+	_, ok := req.(consumedPKCERequester)
+	return ok
+}
+
 func NewExampleStore() *MemoryStore {
 	return &MemoryStore{
 		IDSessions: make(map[string]fosite.Requester),
@@ -298,6 +328,12 @@ func (s *MemoryStore) GetPKCERequestSession(_ context.Context, code string, _ fo
 	if !ok {
 		return nil, fosite.ErrNotFound
 	}
+	if isPKCERequestConsumed(rel) {
+		// The session was already consumed by a successful exchange. Returning the
+		// requester together with the sentinel error lets the PKCE handler reject
+		// replays with a stable result instead of treating them as "no PKCE data".
+		return rel, ErrInvalidatedPKCERequest
+	}
 	return rel, nil
 }
 
@@ -305,7 +341,21 @@ func (s *MemoryStore) DeletePKCERequestSession(_ context.Context, code string) e
 	s.pkcesMutex.Lock()
 	defer s.pkcesMutex.Unlock()
 
-	delete(s.PKCES, code)
+	rel, ok := s.PKCES[code]
+	if !ok {
+		return fosite.ErrNotFound
+	}
+	// The consume operation is a compare-and-swap: a session that has already
+	// been consumed can not be consumed a second time, which makes concurrent
+	// token exchanges resolve deterministically with exactly one winner.
+	if isPKCERequestConsumed(rel) {
+		return ErrInvalidatedPKCERequest
+	}
+	// Retain the consumed session instead of hard-deleting it. A failed
+	// verification never reaches this method, so the challenge stays available
+	// for a retry with the correct verifier; a successful exchange marks the
+	// session consumed, making every subsequent replay deterministically fail.
+	s.PKCES[code] = markPKCERequestConsumed(rel)
 	return nil
 }
 
